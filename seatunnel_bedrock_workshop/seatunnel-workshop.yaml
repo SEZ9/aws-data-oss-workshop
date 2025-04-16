@@ -81,8 +81,8 @@ Resources:
           cd /opt
           
           # Download and install SeaTunnel
-          wget "http://d1zdik9qlbf8wr.cloudfront.net/apache-seatunnel-2.3.10-bin.tar.gz"
-          tar -xzvf "apache-seatunnel-2.3.10-bin.tar.gz" -C /opt/
+          wget "https://d3aapnkdktrlpk.cloudfront.net/apache-seatunnel-2.3.10-bin.tar"
+          tar -xzvf "apache-seatunnel-2.3.10-bin.tar" -C /opt/
           cd /opt/apache-seatunnel-2.3.10
           
           # Install plugins
@@ -130,7 +130,7 @@ Resources:
   CognitoUserPool:
     Type: AWS::Cognito::UserPool
     Properties:
-      UserPoolName: !Sub "${CognitoUserPoolNamePrefix}-${AWS::StackName}"
+      UserPoolName: !Ref CognitoUserPoolNamePrefix
       Policies:
         PasswordPolicy:
           MinimumLength: 8
@@ -138,20 +138,11 @@ Resources:
           RequireUppercase: false
           RequireNumbers: false
           RequireSymbols: false
-      Schema:
-        - Name: email
-          AttributeDataType: String
-          Mutable: true
-          Required: true
-      AutoVerifiedAttributes:
-        - email
-      AdminCreateUserConfig:
-        AllowAdminCreateUserOnly: true
 
   MyCognitoUserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
-      Domain: !Sub "${UserPoolDomainPrefix}-${AWS::StackName}"
+      Domain: !Ref UserPoolDomainPrefix
       UserPoolId: !Ref CognitoUserPool
 
   CognitoUserPoolClientId:
@@ -166,7 +157,7 @@ Resources:
   CognitoIdentityPool:
     Type: AWS::Cognito::IdentityPool
     Properties:
-      IdentityPoolName: !Sub "MyIdentityPool-${AWS::StackName}"
+      IdentityPoolName: MyIdentityPool
       AllowUnauthenticatedIdentities: false
       CognitoIdentityProviders:
         - ProviderName: !Sub cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
@@ -241,11 +232,6 @@ Resources:
 
   #####################################
   # OpenSearch Resources
-  # 注意：Cognito 用户需要在部署后手动创建
-  # 可以使用 AWS CLI 命令创建用户并设置密码：
-  # aws cognito-idp admin-create-user --user-pool-id <user-pool-id> --username admin --temporary-password <password> --no-email
-  # aws cognito-idp admin-set-user-password --user-pool-id <user-pool-id> --username admin --password <password> --permanent
-
   OpenSearchDomain:
     Type: AWS::OpenSearchService::Domain
     Properties:
