@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create EC2 instance with SeaTunnel, OpenSearch, and S3 resources'
+
+Parameters:
+  # OpenSearch and Cognito Parameters
+  OpenSearchMasterUsername:
+    Type: String
+    Description: Username for OpenSearch master user
+    Default: admin
+    
+  OpenSearchMasterPassword:
+    Type: String
+    Description: Password for OpenSearch master user (must be at least 8 characters and include uppercase, lowercase, numbers, and special characters)
+    NoEcho: true
+    MinLength: 8
+    ConstraintDescription: Password must be at least 8 characters
+    
+  BucketNamePrefix:
+    Type: String
+    Default: data-oss
+    Description: Prefix for the S3 bucket name
+    
+  CognitoUserPoolNamePrefix:
+    Type: String
+    Default: 'userpool'
+    Description: Prefix for the Cognito user pool name
+    
+  UserPoolDomainPrefix:
+    Type: String
+    Default: 'userdomain'
+    Description: Prefix for the Cognito domain name
+
+Resources:
+  #####################################
+  # S3 Resources
+  #####################################
+  RandomBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketNamePrefix}-${AWS::StackName}-${AWS::AccountId}"
+
+  #####################################
+  # EC2 Resources
+  #####################################
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "SeaTunnelKeyPair-${AWS::StackName}"
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: c6i.large
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      KeyName: !Ref EC2KeyPair
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      Tags:
+        - Key: Name
+          Value: !Sub "SeaTunnel-Instance-${AWS::StackName}"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update system packages
+          dnf update -y
+          
+          # Install Java 8
+          dnf install -y java-1.8.0-amazon-corretto-devel
+          
+          # Create directory for SeaTunnel
+          cd /opt
+          
+          # Download and install SeaTunnel
+          wget "http://d1zdik9qlbf8wr.cloudfront.net/apache-seatunnel-2.3.10-bin.tar.gz"
+          tar -xzvf "apache-seatunnel-2.3.10-bin.tar.gz" -C /opt/
+          cd /opt/apache-seatunnel-2.3.10
+          
+          # Install plugins
+          sh bin/install-plugin.sh 2.3.10
+          
+          # Create st_bedrock.conf file
+          cat > /opt/apache-seatunnel-2.3.10/st_bedrock.conf << 'EOL'
+          # SeaTunnel Bedrock Configuration
+          env {
+            execution.parallelism = 1
+            job.mode = "BATCH"
+          }
+
+          source {
+            # Source configuration can be added here
+            # Example:
+            # Fake {
+            #   result_table_name = "fake"
+            #   row.num = 100
+            # }
+          }
+
+          transform {
+            # Transform configuration can be added here
+          }
+
+          sink {
+            # Sink configuration can be added here
+            # Example:
+            # Console {
+            #   source_table_name = "fake"
+            # }
+          }
+          EOL
+          
+          # Set permissions
+          chmod -R 755 /opt/apache-seatunnel-2.3.10
+          
+          # Create a symbolic link for easier access
+          ln -s /opt/apache-seatunnel-2.3.10 /opt/seatunnel
+
+  #####################################
+  # Cognito Resources
+  #####################################
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${CognitoUserPoolNamePrefix}-${AWS::StackName}"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  MyCognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${UserPoolDomainPrefix}-${AWS::StackName}"
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: MyUserPoolClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub "MyIdentityPool-${AWS::StackName}"
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ProviderName: !Sub cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+          ClientId: !Ref CognitoUserPoolClientId
+
+  #####################################
+  # IAM Roles
+  #####################################
+  MyAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action: "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref CognitoIdentityPool
+      Policies:
+        - PolicyName: "CognitoAccessPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "*"
+                Resource: "*"
+
+  MyIdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles:
+        authenticated: !GetAtt MyAuthenticatedRole.Arn
+
+  MyOpenSearchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "es.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonESFullAccess" 
+        - "arn:aws:iam::aws:policy/AmazonCognitoPowerUser"
+
+  ETLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "opensearch-etl-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - es.amazonaws.com
+                - osis-pipelines.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchIngestionFullAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchIngestionReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  #####################################
+  # OpenSearch Resources
+  # 注意：Cognito 用户需要在部署后手动创建
+  # 可以使用 AWS CLI 命令创建用户并设置密码：
+  # aws cognito-idp admin-create-user --user-pool-id <user-pool-id> --username admin --temporary-password <password> --no-email
+  # aws cognito-idp admin-set-user-password --user-pool-id <user-pool-id> --username admin --password <password> --permanent
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub "opensearch-${AWS::StackName}"
+      EngineVersion: OpenSearch_2.17
+      ClusterConfig:
+        InstanceCount: 1
+        InstanceType: "r7g.medium.search"
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: !Ref OpenSearchMasterUsername
+          MasterUserPassword: !Ref OpenSearchMasterPassword
+      CognitoOptions:
+        Enabled: true
+        IdentityPoolId: !Ref CognitoIdentityPool
+        RoleArn: !GetAtt MyOpenSearchRole.Arn
+        UserPoolId: !Ref CognitoUserPool
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/opensearch-${AWS::StackName}/*'
+
+Outputs:
+  # S3 Outputs
+  S3BucketWebsiteURL:
+    Description: "The URL of the S3 bucket website endpoint"
+    Value: !Sub "http://${RandomBucket}.s3-website.${AWS::Region}.amazonaws.com"
+    
+  # EC2 Outputs
+  InstanceId:
+    Description: InstanceId of the newly created EC2 instance
+    Value: !Ref EC2Instance
+  
+  PublicIP:
+    Description: Public IP address of the newly created EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+  
+  PublicDNS:
+    Description: Public DNS name of the newly created EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
+  
+  KeyPairName:
+    Description: Name of the created key pair for SSH access
+    Value: !Ref EC2KeyPair
+  
+  SSHInstructions:
+    Description: Instructions for connecting via SSH
+    Value: !Sub |
+      IMPORTANT: The private key was automatically created but must be downloaded from the EC2 console.
+      1. Go to EC2 Console > Key Pairs > ${EC2KeyPair}
+      2. Download the private key file
+      3. Set proper permissions: chmod 400 ${EC2KeyPair}.pem
+      4. Connect to the instance: ssh -i ${EC2KeyPair}.pem ec2-user@${EC2Instance.PublicDnsName}
+  
+  SeaTunnelPath:
+    Description: Path to the SeaTunnel installation
+    Value: "/opt/apache-seatunnel-2.3.10"
+  
+  ConfigFilePath:
+    Description: Path to the st_bedrock.conf file
+    Value: "/opt/apache-seatunnel-2.3.10/st_bedrock.conf"
+
+  # OpenSearch Outputs
+  OpensearchIAMRoleARN:
+    Description: "ARN of the Opensearch IAM Role"
+    Value: !GetAtt MyAuthenticatedRole.Arn
+    
+  OpenSearchDashboardsURL:
+    Description: OpenSearch Dashboard URL
+    Value: !Join 
+      - ''
+      - - 'https://'
+        - !GetAtt OpenSearchDomain.DomainEndpoint
+        - '/_dashboards'
+        
+  OpenSearchMasterUserCredentials:
+    Description: "OpenSearch master user credentials"
+    Value: !Sub "Username: ${OpenSearchMasterUsername}"
+    
+  CognitoUserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref CognitoUserPool
+    
+  CognitoUserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref CognitoUserPoolClientId
+    
+  CognitoUserPoolDomain:
+    Description: "Cognito User Pool Domain"
+    Value: !Sub "${UserPoolDomainPrefix}-${AWS::StackName}"
